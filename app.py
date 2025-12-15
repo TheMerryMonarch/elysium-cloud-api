@@ -1,8 +1,7 @@
-
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Optional
-from datetime import datetime, timedelta, timezone
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -35,17 +34,24 @@ def health():
     return {"status": "ok"}
 
 @app.post("/ingest")
-def ingest(reading: Reading):
-    """Pi will post here; for now we’ll simulate from your Mac."""
-    global _latest, _history
-    _latest = reading
-    _history.append(reading)
+def ingest(payload: Reading):
+    # Parse incoming timestamp safely (UTC-aware)
+    ts = payload.timestamp
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
 
-    # keep only last 24 hours of data
-    cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+    payload.timestamp = dt
+
+    # Prune history using UTC-aware cutoff
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     _history[:] = [r for r in _history if r.timestamp >= cutoff]
 
-    return {"status": "ok"}
+    _history.append(payload)
+    _latest.clear()
+    _latest.update(payload.dict())
+
+    return {"ok": True}
 
 @app.get("/latest", response_model=Optional[Reading])
 def latest():
