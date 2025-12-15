@@ -1,31 +1,9 @@
-from datetime import datetime, timezone, timedelta
 from typing import Any
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Optional
 from fastapi.middleware.cors import CORSMiddleware
 
-def to_utc_aware(dt_or_str: Any) -> datetime:
-    """
-    Convert incoming timestamp (datetime or ISO string) into a timezone-aware UTC datetime.
-    Accepts:
-      - "2025-12-15T19:55:00Z"
-      - "2025-12-15T19:55:00+00:00"
-      - naive ISO strings (assumed UTC)
-      - datetime objects (naive assumed UTC)
-    """
-    if isinstance(dt_or_str, datetime):
-        dt = dt_or_str
-    else:
-        s = str(dt_or_str).strip()
-        # Handle trailing Z
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
 
 app = FastAPI(
     title="Elysium Cloud API",
@@ -54,20 +32,36 @@ _history: List[Reading] = []
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+from datetime import datetime, timezone, timedelta
+
+def to_utc_aware(ts) -> datetime:
+    # ts may already be a datetime (Pydantic), or a string
+    if isinstance(ts, datetime):
+        dt = ts
+    else:
+        s = str(ts).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return dt.astimezone(timezone.utc)
+
+
 @app.post("/ingest")
 def ingest(payload: Reading):
-    # Normalize incoming timestamp to UTC-aware
     payload.timestamp = to_utc_aware(payload.timestamp)
 
-    # Normalize any existing history timestamps too (just in case older ones were naive)
+    # normalize old history entries too (prevents future prune crashes)
     for r in _history:
         r.timestamp = to_utc_aware(r.timestamp)
 
-    # Prune using UTC-aware cutoff
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     _history[:] = [r for r in _history if r.timestamp >= cutoff]
 
-    # Append + set latest
     _history.append(payload)
     _latest.clear()
     _latest.update(payload.model_dump() if hasattr(payload, "model_dump") else payload.dict())
