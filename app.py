@@ -79,6 +79,9 @@ class IngestPayload(BaseModel):
 
     do_mg_per_l: Optional[float] = None
     dissolved_oxygen: Optional[float] = None  # legacy alias if needed
+    do_percent: Optional[float] = None
+
+    ph: Optional[float] = None
 
     gh: Optional[float] = None
     kh: Optional[float] = None
@@ -90,6 +93,8 @@ class Reading(BaseModel):
     temperature_f: Optional[float] = None
     tds_us_cm: Optional[float] = None
     do_mg_per_l: Optional[float] = None
+    do_percent: Optional[float] = None
+    ph: Optional[float] = None
     gh: Optional[float] = None
     kh: Optional[float] = None
     light_lux: Optional[float] = None
@@ -160,6 +165,8 @@ def ingest(payload: IngestPayload) -> Dict[str, Any]:
         temperature_f=temp,
         tds_us_cm=tds,
         do_mg_per_l=do,
+        do_percent=to_float_or_none(payload.do_percent),
+        ph=to_float_or_none(payload.ph),
         gh=to_float_or_none(payload.gh),
         kh=to_float_or_none(payload.kh),
         light_lux=to_float_or_none(payload.light_lux),
@@ -181,7 +188,7 @@ def ingest(payload: IngestPayload) -> Dict[str, Any]:
 @app.get("/latest")
 def latest() -> Dict[str, Any]:
     if not _latest:
-        return {"timestamp": None, "temperature_f": None, "tds_us_cm": None, "do_mg_per_l": None}
+        return {"timestamp": None, "temperature_f": None, "tds_us_cm": None, "do_mg_per_l": None, "ph": None}
     return _latest.model_dump(mode="json")
 
 
