@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Any, Dict
 
@@ -13,7 +14,8 @@ from pydantic import BaseModel, Field
 # -----------------------------
 # Config
 # -----------------------------
-HISTORY_DAYS = int(os.getenv("HISTORY_DAYS", "30"))  # cloud retention (in-memory)
+HISTORY_DAYS = int(os.getenv("HISTORY_DAYS", "365"))  # 0 = keep forever
+DB_PATH = os.getenv("DB_PATH", "/data/elysium.db")    # set to ":memory:" or empty to force in-memory
 ALLOWED_ORIGINS = os.getenv(
     "CORS_ORIGINS",
     "https://elysiumshrimptank.com,https://www.elysiumshrimptank.com,http://localhost:8000,http://localhost:5000",
@@ -113,16 +115,126 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory store (Render disk is ephemeral; this is for live dashboard)
+# In-memory cache (always populated; on Starter w/ persistent disk, SQLite is canonical)
 _history: List[Reading] = []
 _latest: Optional[Reading] = None
 
+# -----------------------------
+# Storage backend (SQLite on disk if available, otherwise in-memory only)
+# -----------------------------
+USE_DB = False
+_DB_COLS = ("timestamp", "temperature_f", "tds_us_cm", "do_mg_per_l",
+            "do_percent", "ph", "gh", "kh", "light_lux")
+_ingest_count_since_prune = 0
+
+
+def _try_init_db() -> None:
+    global USE_DB
+    if not DB_PATH or DB_PATH == ":memory:":
+        print("[DB] In-memory only (DB_PATH unset or :memory:)")
+        return
+    try:
+        d = os.path.dirname(DB_PATH)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS readings (
+                    timestamp TEXT NOT NULL,
+                    temperature_f REAL,
+                    tds_us_cm REAL,
+                    do_mg_per_l REAL,
+                    do_percent REAL,
+                    ph REAL,
+                    gh REAL,
+                    kh REAL,
+                    light_lux REAL
+                )
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_ts ON readings(timestamp)")
+            c.commit()
+        USE_DB = True
+        print(f"[DB] Persisting to SQLite at {DB_PATH}")
+    except Exception as e:
+        print(f"[DB] DISABLED — falling back to in-memory ({e})")
+        USE_DB = False
+
+
+def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return {k: row[k] for k in _DB_COLS}
+
+
+def _db_insert(reading: Reading) -> None:
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute(
+            "INSERT INTO readings VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                reading.timestamp.isoformat(),
+                reading.temperature_f,
+                reading.tds_us_cm,
+                reading.do_mg_per_l,
+                reading.do_percent,
+                reading.ph,
+                reading.gh,
+                reading.kh,
+                reading.light_lux,
+            ),
+        )
+        c.commit()
+
+
+def _db_history(cutoff: datetime, limit: int) -> List[Dict[str, Any]]:
+    with sqlite3.connect(DB_PATH) as c:
+        c.row_factory = sqlite3.Row
+        rows = c.execute(
+            "SELECT * FROM readings WHERE timestamp >= ? ORDER BY timestamp LIMIT ?",
+            (cutoff.isoformat(), limit),
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def _db_latest() -> Optional[Dict[str, Any]]:
+    with sqlite3.connect(DB_PATH) as c:
+        c.row_factory = sqlite3.Row
+        row = c.execute(
+            "SELECT * FROM readings ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def _db_prune(cutoff: datetime) -> None:
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("DELETE FROM readings WHERE timestamp < ?", (cutoff.isoformat(),))
+        c.commit()
+
+
+def _db_count() -> int:
+    with sqlite3.connect(DB_PATH) as c:
+        return c.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
+
 
 def prune_history(now_utc: datetime) -> None:
+    if HISTORY_DAYS <= 0:
+        return
     cutoff = now_utc - timedelta(days=HISTORY_DAYS)
-    # All timestamps are forced to tz-aware UTC, so comparisons are safe
-    global _history
-    _history = [r for r in _history if r.timestamp >= cutoff]
+    if USE_DB:
+        _db_prune(cutoff)
+    else:
+        global _history
+        _history = [r for r in _history if r.timestamp >= cutoff]
+
+
+_try_init_db()
+
+# Warm the latest-cache from DB on cold start so /latest is fast
+if USE_DB:
+    try:
+        _latest_row = _db_latest()
+        if _latest_row:
+            _latest = Reading(**_latest_row)
+    except Exception as e:
+        print(f"[DB] Warm-cache failed: {e}")
 
 
 # -----------------------------
@@ -130,17 +242,27 @@ def prune_history(now_utc: datetime) -> None:
 # -----------------------------
 @app.get("/health")
 def health() -> Dict[str, Any]:
+    if USE_DB:
+        try:
+            count = _db_count()
+        except Exception as e:
+            count = -1
+            print(f"[DB] count failed: {e}")
+    else:
+        count = len(_history)
     return {
         "ok": True,
         "history_days": HISTORY_DAYS,
-        "count": len(_history),
+        "storage": "sqlite" if USE_DB else "in-memory",
+        "db_path": DB_PATH if USE_DB else None,
+        "count": count,
         "latest_timestamp": (_latest.timestamp.isoformat() if _latest else None),
     }
 
 
 @app.post("/ingest")
 def ingest(payload: IngestPayload) -> Dict[str, Any]:
-    global _latest, _history
+    global _latest, _history, _ingest_count_since_prune
 
     try:
         ts = parse_timestamp(payload.timestamp)
@@ -173,23 +295,39 @@ def ingest(payload: IngestPayload) -> Dict[str, Any]:
     )
 
     _latest = reading
-    _history.append(reading)
-
-    prune_history(datetime.now(timezone.utc))
+    if USE_DB:
+        _db_insert(reading)
+        _ingest_count_since_prune += 1
+        # Prune occasionally — once every ~1000 inserts (~80 min at 5s cadence)
+        if _ingest_count_since_prune >= 1000:
+            prune_history(datetime.now(timezone.utc))
+            _ingest_count_since_prune = 0
+    else:
+        _history.append(reading)
+        prune_history(datetime.now(timezone.utc))
 
     return {
         "ok": True,
         "stored": 1,
         "latest": reading.model_dump(mode="json"),
-        "count": len(_history),
     }
 
 
 @app.get("/latest")
 def latest() -> Dict[str, Any]:
-    if not _latest:
-        return {"timestamp": None, "temperature_f": None, "tds_us_cm": None, "do_mg_per_l": None, "ph": None}
-    return _latest.model_dump(mode="json")
+    if _latest:
+        return _latest.model_dump(mode="json")
+    if USE_DB:
+        try:
+            row = _db_latest()
+            if row:
+                return row
+        except Exception as e:
+            print(f"[DB] /latest failed: {e}")
+    return {
+        "timestamp": None, "temperature_f": None, "tds_us_cm": None,
+        "do_mg_per_l": None, "do_percent": None, "ph": None,
+    }
 
 
 @app.get("/history")
@@ -204,6 +342,13 @@ def history(
     """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=max(1, hours))
+    safe_limit = max(1, min(limit, 200000))
+
+    if USE_DB:
+        try:
+            return _db_history(cutoff, safe_limit)
+        except Exception as e:
+            print(f"[DB] /history failed, falling back to in-memory: {e}")
 
     rows = [r for r in _history if r.timestamp >= cutoff]
     rows = rows[-max(1, min(limit, 20000)) :]  # safety cap
