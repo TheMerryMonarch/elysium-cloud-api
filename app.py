@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Any, Dict
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -311,6 +311,54 @@ def ingest(payload: IngestPayload) -> Dict[str, Any]:
         "stored": 1,
         "latest": reading.model_dump(mode="json"),
     }
+
+
+# -----------------------------
+# MO/TH/ER narration feed
+# -----------------------------
+NARRATION_TOKEN = os.getenv("NARRATION_TOKEN", "")
+
+
+class NarrationEntry(BaseModel):
+    ts: Any
+    text: str
+
+
+class NarrationPayload(BaseModel):
+    entries: List[NarrationEntry]
+
+
+# In-memory like the readings; the Pi publisher re-sends its recent window
+# every few minutes, so the feed self-heals after a restart/redeploy.
+_narration: List[Dict[str, Any]] = []
+
+
+@app.post("/narration")
+def narration_ingest(
+    payload: NarrationPayload,
+    x_narration_token: str = Header(default=""),
+) -> Dict[str, Any]:
+    if not NARRATION_TOKEN or x_narration_token != NARRATION_TOKEN:
+        raise HTTPException(status_code=401, detail="bad narration token")
+    global _narration
+    merged: Dict[Any, Dict[str, Any]] = {(e["ts"], e["text"]): e for e in _narration}
+    for entry in payload.entries:
+        try:
+            ts = parse_timestamp(entry.ts)
+        except Exception:
+            continue
+        text = entry.text.strip()
+        if not text:
+            continue
+        key = (ts.isoformat(), text)
+        merged[key] = {"ts": ts.isoformat(), "text": text}
+    _narration = sorted(merged.values(), key=lambda e: e["ts"])[-200:]
+    return {"ok": True, "count": len(_narration)}
+
+
+@app.get("/narration")
+def narration(limit: int = 20) -> List[Dict[str, Any]]:
+    return _narration[-max(1, min(limit, 100)):]
 
 
 @app.get("/latest")
