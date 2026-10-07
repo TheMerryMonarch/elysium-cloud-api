@@ -1,12 +1,15 @@
 # app.py (Render / cloud)
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Any, Dict
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -368,6 +371,167 @@ def narration_ingest(
 @app.get("/narration")
 def narration(limit: int = 20) -> List[Dict[str, Any]]:
     return _narration[-max(1, min(limit, 100)):]
+
+
+# -----------------------------
+# MO/TH/ER reading ballot
+# -----------------------------
+# The Pi is authoritative: it pushes the ballot (options, schedule, result) on
+# every publish run and pulls the vote counts when voting closes. This app only
+# collects votes, one per browser token, with a per-IP cap as a backstop.
+# Voter tokens and IPs are stored only as salted hashes. Counts stay hidden
+# while voting is open so the vote is not a bandwagon.
+BALLOT_SALT = os.getenv("BALLOT_SALT", "") or NARRATION_TOKEN
+BALLOT_MAX_PER_IP = int(os.getenv("BALLOT_MAX_PER_IP", "5"))
+_VOTER_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+
+_ballot: Optional[Dict[str, Any]] = None
+_votes_mem: Dict[str, Dict[str, Dict[str, str]]] = {}   # in-memory fallback: ballot -> voter -> {option, ip}
+
+
+class BallotOption(BaseModel):
+    id: str
+    label: str
+    author: str
+    work_title: str
+    title: str
+    continue_: bool = Field(alias="continue")
+
+
+class BallotPayload(BaseModel):
+    id: str
+    status: str
+    opens_at: str
+    closes_at: str
+    next_start_at: str
+    options: List[BallotOption]
+    now_reading: Dict[str, Any]
+    result: Optional[Dict[str, Any]] = None
+
+
+class VotePayload(BaseModel):
+    ballot_id: str
+    option: str
+    voter: str
+
+
+def _hash(value: str) -> str:
+    return hashlib.sha256(f"{BALLOT_SALT}:{value}".encode()).hexdigest()[:32]
+
+
+def _ballot_db_init() -> None:
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("CREATE TABLE IF NOT EXISTS ballot_state (id INTEGER PRIMARY KEY CHECK (id = 1), body TEXT NOT NULL)")
+        c.execute("""CREATE TABLE IF NOT EXISTS ballot_votes (
+            ballot_id TEXT NOT NULL, voter TEXT NOT NULL, ip TEXT NOT NULL,
+            option TEXT NOT NULL, ts TEXT NOT NULL, PRIMARY KEY (ballot_id, voter))""")
+        c.commit()
+
+
+def _ballot_load() -> None:
+    global _ballot
+    if not USE_DB:
+        return
+    try:
+        _ballot_db_init()
+        with sqlite3.connect(DB_PATH) as c:
+            row = c.execute("SELECT body FROM ballot_state WHERE id = 1").fetchone()
+        _ballot = json.loads(row[0]) if row else None
+    except Exception as e:
+        print(f"[DB] ballot load failed: {e}")
+
+
+_ballot_load()
+
+
+def _ballot_status(b: Dict[str, Any]) -> str:
+    if b.get("status") in ("tie", "decided"):
+        return b["status"]
+    now = datetime.now(timezone.utc)
+    if now < parse_timestamp(b["opens_at"]):
+        return "locked"
+    if now < parse_timestamp(b["closes_at"]):
+        return "open"
+    return "closed"
+
+
+def _ballot_counts(ballot_id: str) -> Dict[str, int]:
+    if USE_DB:
+        with sqlite3.connect(DB_PATH) as c:
+            rows = c.execute("SELECT option, COUNT(*) FROM ballot_votes WHERE ballot_id = ? GROUP BY option",
+                             (ballot_id,)).fetchall()
+        return {o: n for o, n in rows}
+    counts: Dict[str, int] = {}
+    for v in _votes_mem.get(ballot_id, {}).values():
+        counts[v["option"]] = counts.get(v["option"], 0) + 1
+    return counts
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    return fwd.split(",")[0].strip() or (request.client.host if request.client else "unknown")
+
+
+@app.post("/ballot")
+def ballot_push(payload: BallotPayload, x_narration_token: str = Header(default="")) -> Dict[str, Any]:
+    if not NARRATION_TOKEN or x_narration_token != NARRATION_TOKEN:
+        raise HTTPException(status_code=401, detail="bad token")
+    global _ballot
+    _ballot = payload.model_dump(by_alias=True)
+    if USE_DB:
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute("INSERT OR REPLACE INTO ballot_state (id, body) VALUES (1, ?)", (json.dumps(_ballot),))
+            c.commit()
+    return {"ok": True, "status": _ballot_status(_ballot)}
+
+
+@app.get("/ballot")
+def ballot_get() -> Dict[str, Any]:
+    if not _ballot:
+        return {"ballot": None}
+    b = dict(_ballot)
+    b["status"] = _ballot_status(b)
+    if b["status"] in ("closed", "tie", "decided"):
+        b["counts"] = _ballot_counts(b["id"])
+    return {"ballot": b}
+
+
+@app.post("/ballot/vote")
+def ballot_vote(payload: VotePayload, request: Request) -> Dict[str, Any]:
+    if not _ballot or payload.ballot_id != _ballot["id"] or _ballot_status(_ballot) != "open":
+        raise HTTPException(status_code=409, detail="voting is not open for this ballot")
+    if payload.option not in {o["id"] for o in _ballot["options"]}:
+        raise HTTPException(status_code=400, detail="unknown option")
+    if not _VOTER_RE.match(payload.voter):
+        raise HTTPException(status_code=400, detail="bad voter token")
+    voter, ip = _hash(payload.voter), _hash(_client_ip(request))
+    bid = payload.ballot_id
+    if USE_DB:
+        with sqlite3.connect(DB_PATH) as c:
+            row = c.execute("SELECT option FROM ballot_votes WHERE ballot_id = ? AND voter = ?", (bid, voter)).fetchone()
+            if row:
+                return {"ok": True, "already": row[0]}
+            n_ip = c.execute("SELECT COUNT(*) FROM ballot_votes WHERE ballot_id = ? AND ip = ?", (bid, ip)).fetchone()[0]
+            if n_ip >= BALLOT_MAX_PER_IP:
+                raise HTTPException(status_code=429, detail="too many votes from this address")
+            c.execute("INSERT INTO ballot_votes (ballot_id, voter, ip, option, ts) VALUES (?, ?, ?, ?, ?)",
+                      (bid, voter, ip, payload.option, datetime.now(timezone.utc).isoformat()))
+            c.commit()
+    else:
+        votes = _votes_mem.setdefault(bid, {})
+        if voter in votes:
+            return {"ok": True, "already": votes[voter]["option"]}
+        if sum(1 for v in votes.values() if v["ip"] == ip) >= BALLOT_MAX_PER_IP:
+            raise HTTPException(status_code=429, detail="too many votes from this address")
+        votes[voter] = {"option": payload.option, "ip": ip}
+    return {"ok": True, "already": None, "option": payload.option}
+
+
+@app.get("/ballot/votes")
+def ballot_votes(ballot_id: str, x_narration_token: str = Header(default="")) -> Dict[str, Any]:
+    if not NARRATION_TOKEN or x_narration_token != NARRATION_TOKEN:
+        raise HTTPException(status_code=401, detail="bad token")
+    return {"ballot_id": ballot_id, "counts": _ballot_counts(ballot_id)}
 
 
 @app.get("/latest")
