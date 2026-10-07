@@ -84,6 +84,7 @@ class IngestPayload(BaseModel):
     do_percent: Optional[float] = None
 
     ph: Optional[float] = None
+    orp_mv: Optional[float] = None
 
     gh: Optional[float] = None
     kh: Optional[float] = None
@@ -100,6 +101,7 @@ class Reading(BaseModel):
     gh: Optional[float] = None
     kh: Optional[float] = None
     light_lux: Optional[float] = None
+    orp_mv: Optional[float] = None
 
 
 # -----------------------------
@@ -124,7 +126,7 @@ _latest: Optional[Reading] = None
 # -----------------------------
 USE_DB = False
 _DB_COLS = ("timestamp", "temperature_f", "tds_us_cm", "do_mg_per_l",
-            "do_percent", "ph", "gh", "kh", "light_lux")
+            "do_percent", "ph", "gh", "kh", "light_lux", "orp_mv")
 _ingest_count_since_prune = 0
 
 
@@ -149,9 +151,14 @@ def _try_init_db() -> None:
                     ph REAL,
                     gh REAL,
                     kh REAL,
-                    light_lux REAL
+                    light_lux REAL,
+                    orp_mv REAL
                 )
             """)
+            # Columns added after the table first shipped.
+            have = {r[1] for r in c.execute("PRAGMA table_info(readings)")}
+            if "orp_mv" not in have:
+                c.execute("ALTER TABLE readings ADD COLUMN orp_mv REAL")
             c.execute("CREATE INDEX IF NOT EXISTS idx_ts ON readings(timestamp)")
             c.commit()
         USE_DB = True
@@ -168,7 +175,7 @@ def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
 def _db_insert(reading: Reading) -> None:
     with sqlite3.connect(DB_PATH) as c:
         c.execute(
-            "INSERT INTO readings VALUES (?,?,?,?,?,?,?,?,?)",
+            f"INSERT INTO readings ({','.join(_DB_COLS)}) VALUES ({','.join('?' * len(_DB_COLS))})",
             (
                 reading.timestamp.isoformat(),
                 reading.temperature_f,
@@ -179,6 +186,7 @@ def _db_insert(reading: Reading) -> None:
                 reading.gh,
                 reading.kh,
                 reading.light_lux,
+                reading.orp_mv,
             ),
         )
         c.commit()
@@ -292,6 +300,7 @@ def ingest(payload: IngestPayload) -> Dict[str, Any]:
         gh=to_float_or_none(payload.gh),
         kh=to_float_or_none(payload.kh),
         light_lux=to_float_or_none(payload.light_lux),
+        orp_mv=to_float_or_none(payload.orp_mv),
     )
 
     _latest = reading
@@ -374,7 +383,7 @@ def latest() -> Dict[str, Any]:
             print(f"[DB] /latest failed: {e}")
     return {
         "timestamp": None, "temperature_f": None, "tds_us_cm": None,
-        "do_mg_per_l": None, "do_percent": None, "ph": None,
+        "do_mg_per_l": None, "do_percent": None, "ph": None, "orp_mv": None,
     }
 
 
