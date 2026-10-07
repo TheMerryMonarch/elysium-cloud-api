@@ -382,6 +382,10 @@ def narration(limit: int = 20) -> List[Dict[str, Any]]:
 # Voter tokens and IPs are stored only as salted hashes. Counts stay hidden
 # while voting is open so the vote is not a bandwagon.
 BALLOT_SALT = os.getenv("BALLOT_SALT", "") or NARRATION_TOKEN
+if not os.getenv("BALLOT_SALT"):
+    # Falling back works, but rotating NARRATION_TOKEN would then re-key every
+    # voter and IP hash mid-ballot. Set BALLOT_SALT on Render.
+    print("[ballot] WARNING: BALLOT_SALT is not set; hashing with NARRATION_TOKEN")
 BALLOT_MAX_PER_IP = int(os.getenv("BALLOT_MAX_PER_IP", "5"))
 _VOTER_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 
@@ -445,7 +449,8 @@ _ballot_load()
 
 
 def _ballot_status(b: Dict[str, Any]) -> str:
-    if b.get("status") in ("tie", "decided"):
+    # The Pi is authoritative once it has closed the ballot, whatever our clock says.
+    if b.get("status") in ("closed", "tie", "decided"):
         return b["status"]
     now = datetime.now(timezone.utc)
     if now < parse_timestamp(b["opens_at"]):
@@ -467,9 +472,26 @@ def _ballot_counts(ballot_id: str) -> Dict[str, int]:
     return counts
 
 
-def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    return fwd.split(",")[0].strip() or (request.client.host if request.client else "unknown")
+def _client_ip(request: Request) -> tuple:
+    """(address, source). Render sits behind Cloudflare, which sets
+    CF-Connecting-IP itself; a client can forge X-Forwarded-For, so that is
+    only a fallback. IPv6 counts by its /64, the usual size of one household."""
+    import ipaddress
+    for header in ("cf-connecting-ip", "true-client-ip"):
+        if request.headers.get(header):
+            raw, source = request.headers[header].strip(), header
+            break
+    else:
+        fwd = request.headers.get("x-forwarded-for", "")
+        raw, source = (fwd.split(",")[0].strip(), "x-forwarded-for") if fwd else (
+            (request.client.host if request.client else "unknown"), "peer")
+    try:
+        ip = ipaddress.ip_address(raw)
+        if ip.version == 6:
+            raw = str(ipaddress.ip_network(f"{ip}/64", strict=False))
+    except ValueError:
+        pass
+    return raw, source
 
 
 @app.post("/ballot")
@@ -504,19 +526,26 @@ def ballot_vote(payload: VotePayload, request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="unknown option")
     if not _VOTER_RE.match(payload.voter):
         raise HTTPException(status_code=400, detail="bad voter token")
-    voter, ip = _hash(payload.voter), _hash(_client_ip(request))
+    voter, ip = _hash(payload.voter), _hash(_client_ip(request)[0])
     bid = payload.ballot_id
     if USE_DB:
-        with sqlite3.connect(DB_PATH) as c:
+        with sqlite3.connect(DB_PATH, timeout=10) as c:
+            c.execute("BEGIN IMMEDIATE")  # serialise the check and the insert
             row = c.execute("SELECT option FROM ballot_votes WHERE ballot_id = ? AND voter = ?", (bid, voter)).fetchone()
             if row:
                 return {"ok": True, "already": row[0]}
             n_ip = c.execute("SELECT COUNT(*) FROM ballot_votes WHERE ballot_id = ? AND ip = ?", (bid, ip)).fetchone()[0]
             if n_ip >= BALLOT_MAX_PER_IP:
                 raise HTTPException(status_code=429, detail="too many votes from this address")
-            c.execute("INSERT INTO ballot_votes (ballot_id, voter, ip, option, ts) VALUES (?, ?, ?, ?, ?)",
-                      (bid, voter, ip, payload.option, datetime.now(timezone.utc).isoformat()))
-            c.commit()
+            try:
+                c.execute("INSERT INTO ballot_votes (ballot_id, voter, ip, option, ts) VALUES (?, ?, ?, ?, ?)",
+                          (bid, voter, ip, payload.option, datetime.now(timezone.utc).isoformat()))
+                c.commit()
+            except sqlite3.IntegrityError:
+                c.rollback()
+                got = c.execute("SELECT option FROM ballot_votes WHERE ballot_id = ? AND voter = ?",
+                                (bid, voter)).fetchone()
+                return {"ok": True, "already": got[0] if got else payload.option}
     else:
         votes = _votes_mem.setdefault(bid, {})
         if voter in votes:
@@ -525,6 +554,14 @@ def ballot_vote(payload: VotePayload, request: Request) -> Dict[str, Any]:
             raise HTTPException(status_code=429, detail="too many votes from this address")
         votes[voter] = {"option": payload.option, "ip": ip}
     return {"ok": True, "already": None, "option": payload.option}
+
+
+@app.get("/ballot/whoami")
+def ballot_whoami(request: Request, x_narration_token: str = Header(default="")) -> Dict[str, Any]:
+    """Pi-only check of which header the vote cap keys on (never the address)."""
+    if not NARRATION_TOKEN or x_narration_token != NARRATION_TOKEN:
+        raise HTTPException(status_code=401, detail="bad token")
+    return {"source": _client_ip(request)[1], "salt_set": bool(os.getenv("BALLOT_SALT"))}
 
 
 @app.get("/ballot/votes")

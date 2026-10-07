@@ -157,3 +157,61 @@ def test_in_memory_fallback_votes_once(monkeypatch):
     assert _vote(c, "c").json()["already"] == "b"
     assert c.get("/ballot/votes", params={"ballot_id": "2026-10-08-republic-0"},
                  headers={"X-Narration-Token": TOKEN}).json()["counts"] == {"b": 1}
+
+
+def _vote_h(c, headers, option="a", voter=None):
+    import uuid
+    return c.post("/ballot/vote", json={"ballot_id": "2026-10-08-republic-0", "option": option,
+                                         "voter": voter or uuid.uuid4().hex}, headers=headers)
+
+
+def test_spoofed_forwarded_for_cannot_dodge_the_ip_cap(client):
+    c, m = client
+    _push(c, _ballot())
+    codes = [_vote_h(c, {"CF-Connecting-IP": "7.7.7.7", "X-Forwarded-For": f"10.0.{i}.1"}).status_code
+             for i in range(m.BALLOT_MAX_PER_IP + 1)]
+    assert codes[-1] == 429
+
+
+def test_ipv6_addresses_in_one_slash64_share_the_cap(client):
+    c, m = client
+    _push(c, _ballot())
+    codes = [_vote_h(c, {"CF-Connecting-IP": f"2001:db8:1:2::{i:x}"}).status_code
+             for i in range(m.BALLOT_MAX_PER_IP + 1)]
+    assert codes[-1] == 429
+
+
+def test_double_submit_race_reports_already(client, monkeypatch):
+    c, m = client
+    _push(c, _ballot())
+    first = _vote_h(c, {"CF-Connecting-IP": "8.8.8.8"}, voter="v" * 32)
+    assert first.status_code == 200
+    # Simulate the race: the pre-check misses the existing row.
+    real_connect = m.sqlite3.connect
+    class Conn:
+        def __init__(self, *a, **k): self.c = real_connect(*a, **k)
+        def __enter__(self): return self
+        def __exit__(self, *a): return self.c.__exit__(*a)
+        def execute(self, sql, params=()):
+            if sql.startswith("SELECT option FROM ballot_votes"):
+                return self.c.execute("SELECT 1 WHERE 0")
+            return self.c.execute(sql, params)
+        def commit(self): self.c.commit()
+        def __getattr__(self, k): return getattr(self.c, k)
+    monkeypatch.setattr(m.sqlite3, "connect", Conn)
+    again = _vote_h(c, {"CF-Connecting-IP": "8.8.8.8"}, option="b", voter="v" * 32)
+    assert again.status_code == 200 and again.json()["already"] is not None
+
+
+def test_pi_closed_status_wins_over_server_clock(client):
+    c, _ = client
+    _push(c, _ballot(status="closed"))              # server clock still says open
+    assert c.get("/ballot").json()["ballot"]["status"] == "closed"
+    assert _vote(c).status_code == 409
+
+
+def test_whoami_reports_the_ip_source_without_the_ip(client):
+    c, _ = client
+    r = c.get("/ballot/whoami", headers={"X-Narration-Token": TOKEN, "CF-Connecting-IP": "9.9.9.9"})
+    assert r.json()["source"] == "cf-connecting-ip" and "9.9.9.9" not in r.text
+    assert c.get("/ballot/whoami").status_code == 401
